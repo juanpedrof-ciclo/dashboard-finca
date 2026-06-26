@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Dashboard Concentrado · Finca Buenos Aires</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { margin: 0; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect } = React;
+
+
+
+// ─── Config ───────────────────────────────────────────────────────────────────
+const SHEET_ID = "1Z2b9El8JHi0FWrfmUyuff19A5K0YYv0kUH0Tx1hqxRI";
+const SHEET_CONSUMO = "registro en finca";
+const SHEET_INVENTARIO = "inventario";
+const KG_PER_BULTO = 40;
+
+const CONSUMO_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(SHEET_CONSUMO)}`;
+const INVENTARIO_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(SHEET_INVENTARIO)}`;
+
+const C = {
+  green: "#2D6A4F", greenLight: "#52B788", greenPale: "#D8F3DC",
+  cream: "#FAFAF7", text: "#1B2D24", muted: "#6B7C75",
+  white: "#FFFFFF", border: "#E0EAE4", highlight: "#1A4731",
+  accent: "#F4A261", warn: "#E76F51",
+};
+
+const getWeekNumber = (date) => {
+  const d = new Date(date);
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() + 3 - ((d.getDay() + 6) % 7));
+  const week1 = new Date(d.getFullYear(), 0, 4);
+  return 1 + Math.round(((d.getTime() - week1.getTime()) / 86400000 - 3 + ((week1.getDay() + 6) % 7)) / 7);
+};
+
+const today = () => new Date().toISOString().split("T")[0];
+const currency = (n) => new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 }).format(n);
+const num = (n, d = 2) => isNaN(n) ? "—" : Number(n).toLocaleString("es-CO", { maximumFractionDigits: d });
+
+const ANIMAL_TYPES = ["Cerdos", "Búfalas", "Pollos"];
+
+// ─── Default lot config ───────────────────────────────────────────────────────
+const DEFAULT_CONFIG = {
+  "Cerdos-Lote 1": {
+    animal: "Cerdos", lote: "Lote 1",
+    totalAnimales: 61, mortalidad: 0, mortalidadAcumulada: 0, edad: "",
+  },
+};
+
+// ─── Parse Google Sheets gviz response ───────────────────────────────────────
+const parseGviz = (raw) => {
+  try {
+    const json = JSON.parse(raw.replace(/^[^(]+\(/, "").replace(/\);?\s*$/, ""));
+    return json.table.rows.map((row) => row.c.map((c) => (c ? c.v : null)));
+  } catch (e) {
+    return [];
+  }
+};
+
+const parseConsumo = (raw) =>
+  parseGviz(raw)
+    .map((r) => ({
+      fecha: r[0] || "", semana: Number(r[1]) || 0,
+      animal: r[2] || "", lote: r[3] || "",
+      kilos: Number(r[4]) || 0, bultos: Number(r[5]) || 0,
+    }))
+    .filter((r) => r.animal && r.lote);
+
+const parseInventario = (raw) =>
+  parseGviz(raw)
+    .map((r) => ({
+      fecha: r[0] || "", animal: r[1] || "",
+      bultos: Number(r[2]) || 0, kilos: Number(r[3]) || 0,
+      costoConcentrado: Number(r[4]) || 0, costoTransporte: Number(r[5]) || 0,
+      costoTotal: Number(r[6]) || 0, costoPorBulto: Number(r[7]) || 0,
+    }))
+    .filter((r) => r.animal);
+
+// ─── StatBox ──────────────────────────────────────────────────────────────────
+function StatBox({ label, value, sub, highlight }) {
+  return (
+    <div style={{ ...st.statBox, ...(highlight ? st.statBoxHL : {}) }}>
+      <p style={st.statLabel}>{label}</p>
+      <p style={st.statValue}>{value}</p>
+      {sub && <p style={st.statSub}>{sub}</p>}
+    </div>
+  );
+}
+
+// ─── Main Dashboard ───────────────────────────────────────────────────────────
+function Dashboard() {
+  const [records, setRecords] = useState([]);
+  const [purchases, setPurchases] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [lastSync, setLastSync] = useState(null);
+  const [lotConfig, setLotConfig] = useState(DEFAULT_CONFIG);
+  const [editingKey, setEditingKey] = useState(null);
+  const [editBuf, setEditBuf] = useState({});
+  const [filterAnimal, setFilterAnimal] = useState("Todos");
+
+  const fetchData = async () => {
+    try {
+      const [consRes, invRes] = await Promise.all([
+        fetch(CONSUMO_URL).then((r) => r.text()),
+        fetch(INVENTARIO_URL).then((r) => r.text()),
+      ]);
+      const consumo = parseConsumo(consRes);
+      const inventario = parseInventario(invRes);
+      setRecords(consumo);
+      setPurchases(inventario);
+      setLastSync(new Date());
+
+      setLotConfig((prev) => {
+        const updated = { ...prev };
+        consumo.forEach((r) => {
+          const key = `${r.animal}-${r.lote}`;
+          if (!updated[key]) {
+            updated[key] = { animal: r.animal, lote: r.lote, totalAnimales: 0, mortalidad: 0, mortalidadAcumulada: 0, edad: "" };
+          }
+        });
+        return updated;
+      });
+    } catch (e) {
+      console.error("Error fetching sheet:", e);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchData();
+    const interval = setInterval(fetchData, 60000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // ── Inventory stats per animal type ──
+  const getInventoryStats = (animal) => {
+    const animalPurchases = purchases.filter((p) => p.animal === animal);
+    const animalConsumo = records.filter((r) => r.animal === animal);
+
+    const kgComprados = animalPurchases.reduce((s, p) => s + p.kilos, 0);
+    const costoTotalCompras = animalPurchases.reduce((s, p) => s + p.costoTotal, 0);
+    const kgConsumidos = animalConsumo.reduce((s, r) => s + r.kilos, 0);
+    const kgDisponibles = kgComprados - kgConsumidos;
+    const bultosDisponibles = kgDisponibles / KG_PER_BULTO;
+
+    // Weighted average cost per bulto (real cost including transport)
+    const costoPromedioPorBulto = kgComprados > 0 ? costoTotalCompras / (kgComprados / KG_PER_BULTO) : 0;
+
+    return { kgComprados, costoTotalCompras, kgConsumidos, kgDisponibles, bultosDisponibles, costoPromedioPorBulto };
+  };
+
+  const getLotKey = (animal, lote) => `${animal}-${lote}`;
+  const allLotKeys = [...new Set([...Object.keys(lotConfig), ...records.map((r) => getLotKey(r.animal, r.lote))])];
+  const filteredKeys = filterAnimal === "Todos" ? allLotKeys : allLotKeys.filter((k) => k.startsWith(filterAnimal));
+
+  const getLotStats = (key) => {
+    const cfg = lotConfig[key] || {};
+    const lotRecords = records.filter((r) => getLotKey(r.animal, r.lote) === key);
+    const currentWeek = getWeekNumber(today());
+    const weekRecords = lotRecords.filter((r) => r.semana === currentWeek);
+
+    const totalKgAcum = lotRecords.reduce((s, r) => s + r.kilos, 0);
+    const totalBultosAcum = totalKgAcum / KG_PER_BULTO;
+    const weekKg = weekRecords.reduce((s, r) => s + r.kilos, 0);
+    const weekBultos = weekKg / KG_PER_BULTO;
+
+    const totalVivos = Math.max(0, (cfg.totalAnimales || 0) - (cfg.mortalidadAcumulada || 0));
+    const consumoPorAnimal = totalVivos > 0 ? totalKgAcum / totalVivos : 0;
+    const consumoSemanaAnimal = totalVivos > 0 ? weekKg / totalVivos : 0;
+
+    // Real weighted cost per bulto from purchase history for this animal type
+    const invStats = getInventoryStats(cfg.animal);
+    const precioBulto = invStats.costoPromedioPorBulto;
+    const costoTotal = totalBultosAcum * precioBulto;
+    const costoPorAnimal = totalVivos > 0 ? costoTotal / totalVivos : 0;
+
+    return {
+      ...cfg, key, totalKgAcum, totalBultosAcum, weekKg, weekBultos,
+      totalVivos, consumoPorAnimal, consumoSemanaAnimal,
+      precioBulto, costoTotal, costoPorAnimal,
+      currentWeek, recordCount: lotRecords.length,
+    };
+  };
+
+  const allStats = allLotKeys.map(getLotStats);
+  const totalBultosSemana = allStats.reduce((s, x) => s + x.weekBultos, 0);
+  const totalCostoAcum = allStats.reduce((s, x) => s + x.costoTotal, 0);
+
+  const startEdit = (key) => { setEditingKey(key); setEditBuf({ ...(lotConfig[key] || {}) }); };
+  const saveEdit = (key) => {
+    setLotConfig((prev) => ({
+      ...prev,
+      [key]: {
+        ...prev[key], ...editBuf,
+        totalAnimales: Number(editBuf.totalAnimales) || 0,
+        mortalidad: Number(editBuf.mortalidad) || 0,
+        mortalidadAcumulada: Number(editBuf.mortalidadAcumulada) || 0,
+      },
+    }));
+    setEditingKey(null);
+  };
+
+  const ANIMALS = ["Todos", ...ANIMAL_TYPES];
+
+  return (
+    <div style={st.page}>
+      {/* Header */}
+      <div style={st.header}>
+        <div>
+          <p style={st.headerSub}>🌿 Finca Buenos Aires · Ciclo Regenerative Farming</p>
+          <h1 style={st.headerTitle}>Dashboard Concentrado</h1>
+          <p style={st.headerMeta}>
+            Semana {getWeekNumber(today())} ·{" "}
+            {new Date().toLocaleDateString("es-CO", { weekday: "long", year: "numeric", month: "long", day: "numeric" })}
+          </p>
+        </div>
+        <button style={st.refreshBtn} onClick={fetchData} title="Actualizar">
+          🔄{lastSync && <span style={st.syncTime}>{lastSync.toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}</span>}
+        </button>
+      </div>
+
+      {loading && <div style={st.loadingBox}><p style={st.loadingText}>Cargando datos del Sheet...</p></div>}
+
+      {!loading && (
+        <>
+          {/* Summary */}
+          <div style={st.summaryRow}>
+            <div style={st.summaryCard}>
+              <p style={st.summaryLabel}>Registros totales</p>
+              <p style={st.summaryVal}>{records.length}</p>
+            </div>
+            <div style={st.summaryCard}>
+              <p style={st.summaryLabel}>Bultos esta semana</p>
+              <p style={st.summaryVal}>{num(totalBultosSemana)}</p>
+            </div>
+            <div style={st.summaryCard}>
+              <p style={st.summaryLabel}>Costo total acum.</p>
+              <p style={st.summaryVal}>{currency(totalCostoAcum)}</p>
+            </div>
+            <div style={st.summaryCard}>
+              <p style={st.summaryLabel}>Lotes activos</p>
+              <p style={st.summaryVal}>{allLotKeys.length}</p>
+            </div>
+          </div>
+
+          {/* Inventory section */}
+          <div style={st.invSection}>
+            <h3 style={st.invSectionTitle}>📦 Inventario por tipo de animal</h3>
+            <div style={st.invGrid}>
+              {ANIMAL_TYPES.map((a) => {
+                const inv = getInventoryStats(a);
+                const emoji = a === "Cerdos" ? "🐷" : a === "Búfalas" ? "🐃" : "🐔";
+                const low = (inv.kgDisponibles < KG_PER_BULTO * 2) && (inv.kgComprados > 0);
+                if (inv.kgComprados === 0) return null;
+                return (
+                  <div key={a} style={{ ...st.invCard, ...(low ? st.invCardLow : {}) }}>
+                    <div style={st.invCardHeader}>
+                      <span style={{ fontSize: 22 }}>{emoji}</span>
+                      <p style={st.invCardAnimal}>{a}</p>
+                    </div>
+                    <p style={st.invCardStock}>
+                      {num(inv.bultosDisponibles)} <span style={st.invCardUnit}>bultos</span>
+                    </p>
+                    <p style={st.invCardKg}>{num(inv.kgDisponibles, 0)} kg disponibles</p>
+                    <div style={st.invCardDivider} />
+                    <p style={st.invCardCost}>Costo prom./bulto: {currency(inv.costoPromedioPorBulto)}</p>
+                    {low && <p style={st.invCardWarn}>⚠️ Inventario bajo</p>}
+                  </div>
+                );
+              })}
+              {ANIMAL_TYPES.every((a) => getInventoryStats(a).kgComprados === 0) && (
+                <p style={st.invEmpty}>Aún no se han registrado compras de inventario.</p>
+              )}
+            </div>
+          </div>
+
+          {/* Filter */}
+          <div style={st.filterRow}>
+            {ANIMALS.map((a) => (
+              <button key={a} style={{ ...st.filterChip, ...(filterAnimal === a ? st.filterChipActive : {}) }} onClick={() => setFilterAnimal(a)}>{a}</button>
+            ))}
+          </div>
+
+          {/* Lot cards */}
+          {filteredKeys.length === 0 && (
+            <div style={st.empty}>
+              <p>No hay registros aún.</p>
+              <p style={{ fontSize: 13, opacity: 0.6 }}>Cuando Yeris ingrese el primer dato, aparecerá aquí.</p>
+            </div>
+          )}
+
+          {filteredKeys.map((key) => {
+            const s = getLotStats(key);
+            const isEditing = editingKey === key;
+            const emoji = s.animal === "Cerdos" ? "🐷" : s.animal === "Búfalas" ? "🐃" : "🐔";
+
+            return (
+              <div key={key} style={st.lotCard}>
+                <div style={st.lotHeader}>
+                  <div style={st.lotTitle}>
+                    <span style={{ fontSize: 28 }}>{emoji}</span>
+                    <div>
+                      <h2 style={st.lotName}>{s.lote || key.split("-")[1]}</h2>
+                      <p style={st.lotAnimal}>{s.animal}</p>
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    <span style={st.weekBadge}>Sem. {s.currentWeek}</span>
+                    {!isEditing
+                      ? <button style={st.editBtn} onClick={() => startEdit(key)}>✏️ Editar</button>
+                      : <button style={st.saveBtn} onClick={() => saveEdit(key)}>💾 Guardar</button>}
+                  </div>
+                </div>
+
+                {isEditing && (
+                  <div style={st.editPanel}>
+                    <p style={st.editTitle}>Editar configuración del lote</p>
+                    <p style={st.editNote}>El precio del bulto ahora se calcula automáticamente desde las compras registradas en inventario.</p>
+                    <div style={st.editGrid}>
+                      {[
+                        { label: "Total animales", key: "totalAnimales", type: "number" },
+                        { label: "Mortalidad (semana)", key: "mortalidad", type: "number" },
+                        { label: "Mortalidad acumulada", key: "mortalidadAcumulada", type: "number" },
+                        { label: "Edad", key: "edad", type: "text", placeholder: "Ej: 8 semanas" },
+                      ].map((f) => (
+                        <div key={f.key}>
+                          <label style={st.editLabel}>{f.label}</label>
+                          <input
+                            style={st.editInput} type={f.type} placeholder={f.placeholder || ""}
+                            value={editBuf[f.key] ?? ""}
+                            onChange={(e) => setEditBuf((b) => ({ ...b, [f.key]: e.target.value }))}
+                          />
+                        </div>
+                      ))}
+                    </div>
+                    <button style={{ ...st.editBtn, marginTop: 10 }} onClick={() => setEditingKey(null)}>Cancelar</button>
+                  </div>
+                )}
+
+                <div style={st.statsGrid}>
+                  <StatBox label="Total animales" value={s.totalAnimales || "—"} />
+                  <StatBox label="Animales vivos" value={s.totalVivos || "—"} highlight />
+                  <StatBox label="Edad" value={s.edad || "—"} />
+                  <StatBox label="Mortalidad semana" value={s.mortalidad ?? "—"} />
+                  <StatBox label="Mortalidad acumulada" value={s.mortalidadAcumulada ?? "—"} />
+                  <StatBox label="Consumo semana" value={`${num(s.weekBultos)} bultos`} sub={`${num(s.weekKg)} kg`} />
+                  <StatBox label="Consumo/animal semana" value={`${num(s.consumoSemanaAnimal)} kg`} />
+                  <StatBox label="Consumo total acum." value={`${num(s.totalBultosAcum)} bultos`} sub={`${num(s.totalKgAcum)} kg`} />
+                  <StatBox label="Consumo/animal acum." value={`${num(s.consumoPorAnimal)} kg`} />
+                  <StatBox label="Precio prom./bulto" value={s.precioBulto ? currency(s.precioBulto) : "—"} sub="incluye transporte" />
+                  <StatBox label="Costo total del lote" value={s.costoTotal ? currency(s.costoTotal) : "—"} highlight />
+                  <StatBox label="Costo/animal a la fecha" value={s.costoPorAnimal ? currency(s.costoPorAnimal) : "—"} highlight />
+                </div>
+
+                <p style={st.lotFooter}>{s.recordCount} registro{s.recordCount !== 1 ? "s" : ""} de alimentación</p>
+              </div>
+            );
+          })}
+
+          {/* Purchases table */}
+          {purchases.length > 0 && (
+            <div style={st.tableSection}>
+              <h3 style={st.tableTitle}>Historial de compras (inventario)</h3>
+              <div style={{ overflowX: "auto" }}>
+                <table style={st.table}>
+                  <thead>
+                    <tr>{["Fecha", "Animal", "Bultos", "Kilos", "Concentrado", "Transporte", "Total", "$/Bulto"].map((h) => <th key={h} style={st.th}>{h}</th>)}</tr>
+                  </thead>
+                  <tbody>
+                    {[...purchases].reverse().map((p, i) => (
+                      <tr key={i} style={{ background: i % 2 === 0 ? C.white : C.cream }}>
+                        <td style={st.td}>{p.fecha}</td>
+                        <td style={st.td}>{p.animal}</td>
+                        <td style={st.td}>{num(p.bultos, 1)}</td>
+                        <td style={st.td}>{num(p.kilos, 0)} kg</td>
+                        <td style={st.td}>{currency(p.costoConcentrado)}</td>
+                        <td style={st.td}>{currency(p.costoTransporte)}</td>
+                        <td style={st.td}>{currency(p.costoTotal)}</td>
+                        <td style={st.td}>{currency(p.costoPorBulto)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* Records table */}
+          {records.length > 0 && (
+            <div style={st.tableSection}>
+              <h3 style={st.tableTitle}>Historial de consumo</h3>
+              <div style={{ overflowX: "auto" }}>
+                <table style={st.table}>
+                  <thead>
+                    <tr>{["Fecha", "Semana", "Animal", "Lote", "Kilos", "Bultos"].map((h) => <th key={h} style={st.th}>{h}</th>)}</tr>
+                  </thead>
+                  <tbody>
+                    {[...records].reverse().map((r, i) => (
+                      <tr key={i} style={{ background: i % 2 === 0 ? C.white : C.cream }}>
+                        <td style={st.td}>{r.fecha}</td>
+                        <td style={st.td}>Sem. {r.semana}</td>
+                        <td style={st.td}>{r.animal}</td>
+                        <td style={st.td}>{r.lote}</td>
+                        <td style={st.td}>{num(r.kilos, 1)} kg</td>
+                        <td style={st.td}>{num(r.bultos)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      <p style={st.footer}>Datos en vivo desde Google Sheets · Se actualiza cada minuto</p>
+    </div>
+  );
+}
+
+const st = {
+  page: { minHeight: "100vh", background: "#F2F7F4", fontFamily: "sans-serif", paddingBottom: 60 },
+  header: { background: `linear-gradient(135deg, ${C.highlight} 0%, ${C.green} 100%)`, padding: "24px 20px 20px", color: C.white, display: "flex", justifyContent: "space-between", alignItems: "flex-start" },
+  headerSub: { margin: "0 0 4px", fontSize: 11, letterSpacing: 2, textTransform: "uppercase", opacity: 0.7 },
+  headerTitle: { margin: "0 0 4px", fontSize: 24, fontWeight: 700, fontFamily: "'Georgia', serif" },
+  headerMeta: { margin: 0, fontSize: 12, opacity: 0.65, textTransform: "capitalize" },
+  refreshBtn: { background: "rgba(255,255,255,0.15)", border: "1.5px solid rgba(255,255,255,0.3)", borderRadius: 10, padding: "10px 14px", fontSize: 18, color: C.white, cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 2 },
+  syncTime: { fontSize: 10, opacity: 0.8 },
+  loadingBox: { textAlign: "center", padding: 48 },
+  loadingText: { color: C.muted, fontSize: 15 },
+  summaryRow: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, padding: "16px 14px 0" },
+  summaryCard: { background: C.white, borderRadius: 12, padding: "12px 14px", border: `1px solid ${C.border}` },
+  summaryLabel: { margin: "0 0 4px", fontSize: 10, color: C.muted, textTransform: "uppercase", letterSpacing: 1 },
+  summaryVal: { margin: 0, fontSize: 20, fontWeight: 700, color: C.text },
+  invSection: { margin: "16px 14px 0" },
+  invSectionTitle: { margin: "0 0 10px", fontSize: 14, color: C.text, fontWeight: 700 },
+  invGrid: { display: "grid", gridTemplateColumns: "1fr", gap: 10 },
+  invCard: { background: C.white, border: `1px solid ${C.border}`, borderRadius: 14, padding: "14px 16px" },
+  invCardLow: { borderColor: C.warn, background: "#FFF8F5" },
+  invCardHeader: { display: "flex", alignItems: "center", gap: 8, marginBottom: 6 },
+  invCardAnimal: { margin: 0, fontWeight: 700, color: C.text, fontSize: 14 },
+  invCardStock: { margin: "0 0 2px", fontSize: 26, fontWeight: 700, color: C.green },
+  invCardUnit: { fontSize: 14, fontWeight: 400, color: C.muted },
+  invCardKg: { margin: "0 0 8px", fontSize: 12, color: C.muted },
+  invCardDivider: { height: 1, background: C.border, margin: "8px 0" },
+  invCardCost: { margin: 0, fontSize: 12, color: C.text },
+  invCardWarn: { margin: "6px 0 0", fontSize: 12, color: C.warn, fontWeight: 700 },
+  invEmpty: { color: C.muted, fontSize: 13, padding: "8px 0" },
+  filterRow: { display: "flex", gap: 8, padding: "16px 14px 4px", overflowX: "auto" },
+  filterChip: { padding: "6px 14px", borderRadius: 20, border: `1.5px solid ${C.border}`, background: C.white, fontSize: 13, cursor: "pointer", color: C.muted, whiteSpace: "nowrap" },
+  filterChipActive: { background: C.green, color: C.white, borderColor: C.green },
+  empty: { textAlign: "center", padding: "48px 24px", color: C.muted, fontSize: 15 },
+  lotCard: { margin: "12px 14px", background: C.white, borderRadius: 16, overflow: "hidden", boxShadow: "0 2px 12px rgba(27,45,36,0.07)", border: `1px solid ${C.border}` },
+  lotHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 18px", background: C.greenPale, borderBottom: `1px solid ${C.border}` },
+  lotTitle: { display: "flex", alignItems: "center", gap: 10 },
+  lotName: { margin: 0, fontSize: 17, color: C.text, fontWeight: 700 },
+  lotAnimal: { margin: 0, fontSize: 11, color: C.muted, textTransform: "uppercase", letterSpacing: 1 },
+  weekBadge: { background: C.green, color: C.white, fontSize: 11, padding: "4px 10px", borderRadius: 20 },
+  editBtn: { background: C.white, border: `1.5px solid ${C.green}`, color: C.green, borderRadius: 8, padding: "6px 12px", fontSize: 12, cursor: "pointer", fontWeight: 700 },
+  saveBtn: { background: C.green, border: "none", color: C.white, borderRadius: 8, padding: "6px 12px", fontSize: 12, cursor: "pointer", fontWeight: 700 },
+  editPanel: { padding: "16px 18px", background: "#FFFBF5", borderBottom: `1px solid ${C.border}` },
+  editTitle: { margin: "0 0 8px", fontSize: 11, letterSpacing: 1, textTransform: "uppercase", color: C.muted, fontWeight: 700 },
+  editNote: { margin: "0 0 12px", fontSize: 11, color: C.muted, fontStyle: "italic" },
+  editGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 },
+  editLabel: { display: "block", fontSize: 11, color: C.muted, marginBottom: 4 },
+  editInput: { width: "100%", padding: "8px 10px", borderRadius: 8, border: `1.5px solid ${C.border}`, fontSize: 14, color: C.text, background: C.white, boxSizing: "border-box", outline: "none" },
+  statsGrid: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 1, background: C.border, padding: 1 },
+  statBox: { background: C.white, padding: "12px 10px" },
+  statBoxHL: { background: "#F0FFF4" },
+  statLabel: { margin: "0 0 4px", fontSize: 9, color: C.muted, textTransform: "uppercase", letterSpacing: 0.8, lineHeight: 1.3 },
+  statValue: { margin: 0, fontSize: 14, fontWeight: 700, color: C.text },
+  statSub: { margin: "2px 0 0", fontSize: 10, color: C.muted },
+  lotFooter: { padding: "8px 18px", margin: 0, fontSize: 11, color: C.muted, borderTop: `1px solid ${C.border}`, textAlign: "right" },
+  tableSection: { margin: "12px 14px 0", background: C.white, borderRadius: 16, overflow: "hidden", border: `1px solid ${C.border}` },
+  tableTitle: { margin: 0, padding: "12px 18px", fontSize: 12, fontWeight: 700, color: C.text, borderBottom: `1px solid ${C.border}`, textTransform: "uppercase", letterSpacing: 1 },
+  table: { width: "100%", borderCollapse: "collapse", fontSize: 12 },
+  th: { padding: "8px 12px", background: C.greenPale, color: C.green, fontWeight: 700, textAlign: "left", fontSize: 10, letterSpacing: 1, textTransform: "uppercase", whiteSpace: "nowrap" },
+  td: { padding: "8px 12px", borderBottom: `1px solid ${C.border}`, color: C.text, whiteSpace: "nowrap" },
+  footer: { textAlign: "center", fontSize: 11, color: C.muted, fontFamily: "sans-serif", letterSpacing: 1, marginTop: 24 },
+};
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<Dashboard />);
+</script>
+</body>
+</html>
