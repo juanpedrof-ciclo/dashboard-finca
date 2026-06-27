@@ -33,10 +33,15 @@ const { useState, useEffect } = React;
 const SHEET_ID = "1Z2b9El8JHi0FWrfmUyuff19A5K0YYv0kUH0Tx1hqxRI";
 const SHEET_CONSUMO = "registro en finca";
 const SHEET_INVENTARIO = "inventario";
+const SHEET_SALIDAS = "salidas";
 const KG_PER_BULTO = 40;
+const PAGE_SIZE = 10;
+
+const SCRIPT_URL = "https://script.google.com/macros/s/AKfycbyusvS3kDmndVrEHLMggh7dk7R1Mvls2JPnEaZ4lhMNWIrHlBgRsh6kuDxrO_dq4_Pt/exec";
 
 const CONSUMO_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(SHEET_CONSUMO)}`;
 const INVENTARIO_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(SHEET_INVENTARIO)}`;
+const SALIDAS_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(SHEET_SALIDAS)}`;
 
 const C = {
   green: "#2D6A4F", greenLight: "#52B788", greenPale: "#D8F3DC",
@@ -54,16 +59,22 @@ const getWeekNumber = (date) => {
 };
 
 const today = () => new Date().toISOString().split("T")[0];
+const formatDate = (iso) => {
+  if (!iso || iso.indexOf("-") === -1) return iso;
+  const parts = iso.split("-");
+  return parts[2] + "/" + parts[1] + "/" + parts[0];
+};
 const currency = (n) => new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 }).format(n);
 const num = (n, d = 2) => isNaN(n) ? "—" : Number(n).toLocaleString("es-CO", { maximumFractionDigits: d });
 
 const ANIMAL_TYPES = ["Cerdos", "Búfalas", "Pollos"];
+const MOTIVOS = ["Venta", "Mortalidad", "Otro"];
 
 // ─── Default lot config ───────────────────────────────────────────────────────
 const DEFAULT_CONFIG = {
   "Cerdos-Lote 1": {
     animal: "Cerdos", lote: "Lote 1",
-    totalAnimales: 61, mortalidad: 0, mortalidadAcumulada: 0, edad: "",
+    totalAnimales: 61, edad: "",
   },
 };
 
@@ -110,6 +121,14 @@ const parseInventario = (raw) =>
     }))
     .filter((r) => r.animal);
 
+const parseSalidas = (raw) =>
+  parseGviz(raw)
+    .map((r) => ({
+      fecha: r[0] || "", animal: r[1] || "", lote: r[2] || "",
+      motivo: r[3] || "", cantidad: Number(r[4]) || 0,
+    }))
+    .filter((r) => r.animal && r.lote);
+
 // ─── StatBox ──────────────────────────────────────────────────────────────────
 function StatBox({ label, value, sub, highlight }) {
   return (
@@ -121,10 +140,39 @@ function StatBox({ label, value, sub, highlight }) {
   );
 }
 
+// ─── Paginated table wrapper ──────────────────────────────────────────────────
+function PaginatedTable({ title, headers, rows, renderRow }) {
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
+  const visible = rows.slice(0, visibleCount);
+  const hasMore = (visibleCount < rows.length);
+
+  return (
+    <div style={st.tableSection}>
+      <h3 style={st.tableTitle}>{title}</h3>
+      <div style={{ overflowX: "auto" }}>
+        <table style={st.table}>
+          <thead>
+            <tr>{headers.map((h) => <th key={h} style={st.th}>{h}</th>)}</tr>
+          </thead>
+          <tbody>
+            {visible.map((row, i) => renderRow(row, i))}
+          </tbody>
+        </table>
+      </div>
+      {hasMore && (
+        <button style={st.showMoreBtn} onClick={() => setVisibleCount((v) => v + PAGE_SIZE)}>
+          Ver 10 más ({rows.length - visibleCount} restantes)
+        </button>
+      )}
+    </div>
+  );
+}
+
 // ─── Main Dashboard ───────────────────────────────────────────────────────────
 function Dashboard() {
   const [records, setRecords] = useState([]);
   const [purchases, setPurchases] = useState([]);
+  const [salidas, setSalidas] = useState([]);
   const [loading, setLoading] = useState(true);
   const [lastSync, setLastSync] = useState(null);
   const [lotConfig, setLotConfig] = useState(DEFAULT_CONFIG);
@@ -132,16 +180,24 @@ function Dashboard() {
   const [editBuf, setEditBuf] = useState({});
   const [filterAnimal, setFilterAnimal] = useState("Todos");
 
+  // ── Salida form state ──
+  const [salidaModalKey, setSalidaModalKey] = useState(null);
+  const [salidaForm, setSalidaForm] = useState({ fecha: today(), motivo: "Venta", cantidad: "" });
+  const [salidaStatus, setSalidaStatus] = useState("idle");
+
   const fetchData = async () => {
     try {
-      const [consRes, invRes] = await Promise.all([
+      const [consRes, invRes, salRes] = await Promise.all([
         fetch(CONSUMO_URL).then((r) => r.text()),
         fetch(INVENTARIO_URL).then((r) => r.text()),
+        fetch(SALIDAS_URL).then((r) => r.text()).catch(() => ""),
       ]);
       const consumo = parseConsumo(consRes);
       const inventario = parseInventario(invRes);
+      const salidasData = salRes ? parseSalidas(salRes) : [];
       setRecords(consumo);
       setPurchases(inventario);
+      setSalidas(salidasData);
       setLastSync(new Date());
 
       setLotConfig((prev) => {
@@ -149,7 +205,7 @@ function Dashboard() {
         consumo.forEach((r) => {
           const key = `${r.animal}-${r.lote}`;
           if (!updated[key]) {
-            updated[key] = { animal: r.animal, lote: r.lote, totalAnimales: 0, mortalidad: 0, mortalidadAcumulada: 0, edad: "" };
+            updated[key] = { animal: r.animal, lote: r.lote, totalAnimales: 0, edad: "" };
           }
         });
         return updated;
@@ -178,7 +234,6 @@ function Dashboard() {
     const kgDisponibles = kgComprados - kgConsumidos;
     const bultosDisponibles = kgDisponibles / KG_PER_BULTO;
 
-    // Weighted average cost per bulto (real cost including transport)
     const costoPromedioPorBulto = kgComprados > 0 ? costoTotalCompras / (kgComprados / KG_PER_BULTO) : 0;
 
     return { kgComprados, costoTotalCompras, kgConsumidos, kgDisponibles, bultosDisponibles, costoPromedioPorBulto };
@@ -188,22 +243,35 @@ function Dashboard() {
   const allLotKeys = [...new Set([...Object.keys(lotConfig), ...records.map((r) => getLotKey(r.animal, r.lote))])];
   const filteredKeys = filterAnimal === "Todos" ? allLotKeys : allLotKeys.filter((k) => k.startsWith(filterAnimal));
 
+  // ── Salidas stats per lot ──
+  const getSalidasStats = (key) => {
+    const lotSalidas = salidas.filter((s) => getLotKey(s.animal, s.lote) === key);
+    const totalSalidas = lotSalidas.reduce((sum, s) => sum + s.cantidad, 0);
+    const mortalidadAcumulada = lotSalidas
+      .filter((s) => s.motivo === "Mortalidad")
+      .reduce((sum, s) => sum + s.cantidad, 0);
+    const ventas = lotSalidas
+      .filter((s) => s.motivo === "Venta")
+      .reduce((sum, s) => sum + s.cantidad, 0);
+    return { totalSalidas, mortalidadAcumulada, ventas, registros: lotSalidas };
+  };
+
   const getLotStats = (key) => {
     const cfg = lotConfig[key] || {};
     const lotRecords = records.filter((r) => getLotKey(r.animal, r.lote) === key);
     const currentWeek = getWeekNumber(today());
     const weekRecords = lotRecords.filter((r) => r.semana === currentWeek);
+    const salidasStats = getSalidasStats(key);
 
     const totalKgAcum = lotRecords.reduce((s, r) => s + r.kilos, 0);
     const totalBultosAcum = totalKgAcum / KG_PER_BULTO;
     const weekKg = weekRecords.reduce((s, r) => s + r.kilos, 0);
     const weekBultos = weekKg / KG_PER_BULTO;
 
-    const totalVivos = Math.max(0, (cfg.totalAnimales || 0) - (cfg.mortalidadAcumulada || 0));
+    const totalVivos = Math.max(0, (cfg.totalAnimales || 0) - salidasStats.totalSalidas);
     const consumoPorAnimal = totalVivos > 0 ? totalKgAcum / totalVivos : 0;
     const consumoSemanaAnimal = totalVivos > 0 ? weekKg / totalVivos : 0;
 
-    // Real weighted cost per bulto from purchase history for this animal type
     const invStats = getInventoryStats(cfg.animal);
     const precioBulto = invStats.costoPromedioPorBulto;
     const costoTotal = totalBultosAcum * precioBulto;
@@ -213,6 +281,8 @@ function Dashboard() {
       ...cfg, key, totalKgAcum, totalBultosAcum, weekKg, weekBultos,
       totalVivos, consumoPorAnimal, consumoSemanaAnimal,
       precioBulto, costoTotal, costoPorAnimal,
+      mortalidadAcumulada: salidasStats.mortalidadAcumulada,
+      ventas: salidasStats.ventas,
       currentWeek, recordCount: lotRecords.length,
     };
   };
@@ -228,11 +298,45 @@ function Dashboard() {
       [key]: {
         ...prev[key], ...editBuf,
         totalAnimales: Number(editBuf.totalAnimales) || 0,
-        mortalidad: Number(editBuf.mortalidad) || 0,
-        mortalidadAcumulada: Number(editBuf.mortalidadAcumulada) || 0,
       },
     }));
     setEditingKey(null);
+  };
+
+  // ── Salida submit ──
+  const openSalidaModal = (key) => {
+    setSalidaModalKey(key);
+    setSalidaForm({ fecha: today(), motivo: "Venta", cantidad: "" });
+    setSalidaStatus("idle");
+  };
+
+  const submitSalida = async () => {
+    if (!salidaForm.cantidad || Number(salidaForm.cantidad) <= 0) {
+      setSalidaStatus("error");
+      return;
+    }
+    setSalidaStatus("sending");
+    const cfg = lotConfig[salidaModalKey];
+    const payload = {
+      tipo: "salida",
+      fecha: salidaForm.fecha,
+      animal: cfg.animal,
+      lote: cfg.lote,
+      motivo: salidaForm.motivo,
+      cantidad: Number(salidaForm.cantidad),
+    };
+    try {
+      await fetch(SCRIPT_URL, {
+        method: "POST", mode: "no-cors",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      setSalidas((prev) => [...prev, payload]);
+      setSalidaStatus("success");
+      setTimeout(() => { setSalidaModalKey(null); fetchData(); }, 1200);
+    } catch (e) {
+      setSalidaStatus("error");
+    }
   };
 
   const ANIMALS = ["Todos", ...ANIMAL_TYPES];
@@ -341,21 +445,23 @@ function Dashboard() {
                   </div>
                   <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                     <span style={st.weekBadge}>Sem. {s.currentWeek}</span>
-                    {!isEditing
-                      ? <button style={st.editBtn} onClick={() => startEdit(key)}>✏️ Editar</button>
-                      : <button style={st.saveBtn} onClick={() => saveEdit(key)}>💾 Guardar</button>}
                   </div>
+                </div>
+
+                <div style={st.lotActions}>
+                  {!isEditing
+                    ? <button style={st.editBtn} onClick={() => startEdit(key)}>✏️ Editar lote</button>
+                    : <button style={st.saveBtn} onClick={() => saveEdit(key)}>💾 Guardar</button>}
+                  <button style={st.salidaBtn} onClick={() => openSalidaModal(key)}>🚪 Registrar salida</button>
                 </div>
 
                 {isEditing && (
                   <div style={st.editPanel}>
                     <p style={st.editTitle}>Editar configuración del lote</p>
-                    <p style={st.editNote}>El precio del bulto ahora se calcula automáticamente desde las compras registradas en inventario.</p>
+                    <p style={st.editNote}>El precio del bulto se calcula automáticamente desde las compras. La mortalidad se calcula desde los registros de salida.</p>
                     <div style={st.editGrid}>
                       {[
-                        { label: "Total animales", key: "totalAnimales", type: "number" },
-                        { label: "Mortalidad (semana)", key: "mortalidad", type: "number" },
-                        { label: "Mortalidad acumulada", key: "mortalidadAcumulada", type: "number" },
+                        { label: "Total animales (inicial)", key: "totalAnimales", type: "number" },
                         { label: "Edad", key: "edad", type: "text", placeholder: "Ej: 8 semanas" },
                       ].map((f) => (
                         <div key={f.key}>
@@ -372,12 +478,59 @@ function Dashboard() {
                   </div>
                 )}
 
+                {salidaModalKey === key && (
+                  <div style={st.salidaPanel}>
+                    {salidaStatus === "success" ? (
+                      <p style={st.salidaSuccess}>✓ Salida registrada correctamente</p>
+                    ) : (
+                      <>
+                        <p style={st.editTitle}>Registrar salida de animales</p>
+                        <div style={st.editGrid}>
+                          <div>
+                            <label style={st.editLabel}>Fecha</label>
+                            <input
+                              style={st.editInput} type="date"
+                              value={salidaForm.fecha}
+                              onChange={(e) => setSalidaForm((f) => ({ ...f, fecha: e.target.value }))}
+                            />
+                          </div>
+                          <div>
+                            <label style={st.editLabel}>Motivo</label>
+                            <select
+                              style={st.editInput}
+                              value={salidaForm.motivo}
+                              onChange={(e) => setSalidaForm((f) => ({ ...f, motivo: e.target.value }))}
+                            >
+                              {MOTIVOS.map((m) => <option key={m} value={m}>{m}</option>)}
+                            </select>
+                          </div>
+                          <div>
+                            <label style={st.editLabel}>Cantidad de animales</label>
+                            <input
+                              style={st.editInput} type="number" min="1" placeholder="Ej: 1"
+                              value={salidaForm.cantidad}
+                              onChange={(e) => setSalidaForm((f) => ({ ...f, cantidad: e.target.value }))}
+                            />
+                          </div>
+                        </div>
+                        {salidaStatus === "error" && <p style={st.salidaError}>Ingresa una cantidad válida.</p>}
+                        <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                          <button style={st.saveBtn} onClick={submitSalida} disabled={salidaStatus === "sending"}>
+                            {salidaStatus === "sending" ? "Guardando..." : "Guardar salida"}
+                          </button>
+                          <button style={st.editBtn} onClick={() => setSalidaModalKey(null)}>Cancelar</button>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )}
+
                 <div style={st.statsGrid}>
-                  <StatBox label="Total animales" value={s.totalAnimales || "—"} />
+                  <StatBox label="Total animales inicial" value={s.totalAnimales || "—"} />
                   <StatBox label="Animales vivos" value={s.totalVivos || "—"} highlight />
                   <StatBox label="Edad" value={s.edad || "—"} />
-                  <StatBox label="Mortalidad semana" value={s.mortalidad ?? "—"} />
-                  <StatBox label="Mortalidad acumulada" value={s.mortalidadAcumulada ?? "—"} />
+                  <StatBox label="Vendidos (acum.)" value={s.ventas != null ? s.ventas : 0} />
+                  <StatBox label="Mortalidad acumulada" value={s.mortalidadAcumulada != null ? s.mortalidadAcumulada : 0} />
                   <StatBox label="Consumo semana" value={`${num(s.weekBultos)} bultos`} sub={`${num(s.weekKg)} kg`} />
                   <StatBox label="Consumo/animal semana" value={`${num(s.consumoSemanaAnimal)} kg`} />
                   <StatBox label="Consumo total acum." value={`${num(s.totalBultosAcum)} bultos`} sub={`${num(s.totalKgAcum)} kg`} />
@@ -392,58 +545,42 @@ function Dashboard() {
             );
           })}
 
-          {/* Purchases table */}
           {purchases.length > 0 && (
-            <div style={st.tableSection}>
-              <h3 style={st.tableTitle}>Historial de compras (inventario)</h3>
-              <div style={{ overflowX: "auto" }}>
-                <table style={st.table}>
-                  <thead>
-                    <tr>{["Fecha", "Animal", "Bultos", "Kilos", "Concentrado", "Transporte", "Total", "$/Bulto"].map((h) => <th key={h} style={st.th}>{h}</th>)}</tr>
-                  </thead>
-                  <tbody>
-                    {[...purchases].reverse().map((p, i) => (
-                      <tr key={i} style={{ background: i % 2 === 0 ? C.white : C.cream }}>
-                        <td style={st.td}>{p.fecha}</td>
-                        <td style={st.td}>{p.animal}</td>
-                        <td style={st.td}>{num(p.bultos, 1)}</td>
-                        <td style={st.td}>{num(p.kilos, 0)} kg</td>
-                        <td style={st.td}>{currency(p.costoConcentrado)}</td>
-                        <td style={st.td}>{currency(p.costoTransporte)}</td>
-                        <td style={st.td}>{currency(p.costoTotal)}</td>
-                        <td style={st.td}>{currency(p.costoPorBulto)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
+            <PaginatedTable
+              title="Historial de compras (inventario)"
+              headers={["Fecha", "Animal", "Bultos", "Kilos", "Concentrado", "Transporte", "Total", "$/Bulto"]}
+              rows={[...purchases].reverse()}
+              renderRow={(p, i) => (
+                <tr key={i} style={{ background: i % 2 === 0 ? C.white : C.cream }}>
+                  <td style={st.td}>{formatDate(p.fecha)}</td>
+                  <td style={st.td}>{p.animal}</td>
+                  <td style={st.td}>{num(p.bultos, 1)}</td>
+                  <td style={st.td}>{num(p.kilos, 0)} kg</td>
+                  <td style={st.td}>{currency(p.costoConcentrado)}</td>
+                  <td style={st.td}>{currency(p.costoTransporte)}</td>
+                  <td style={st.td}>{currency(p.costoTotal)}</td>
+                  <td style={st.td}>{currency(p.costoPorBulto)}</td>
+                </tr>
+              )}
+            />
           )}
 
-          {/* Records table */}
           {records.length > 0 && (
-            <div style={st.tableSection}>
-              <h3 style={st.tableTitle}>Historial de consumo</h3>
-              <div style={{ overflowX: "auto" }}>
-                <table style={st.table}>
-                  <thead>
-                    <tr>{["Fecha", "Semana", "Animal", "Lote", "Kilos", "Bultos"].map((h) => <th key={h} style={st.th}>{h}</th>)}</tr>
-                  </thead>
-                  <tbody>
-                    {[...records].reverse().map((r, i) => (
-                      <tr key={i} style={{ background: i % 2 === 0 ? C.white : C.cream }}>
-                        <td style={st.td}>{r.fecha}</td>
-                        <td style={st.td}>Sem. {r.semana}</td>
-                        <td style={st.td}>{r.animal}</td>
-                        <td style={st.td}>{r.lote}</td>
-                        <td style={st.td}>{num(r.kilos, 1)} kg</td>
-                        <td style={st.td}>{num(r.bultos)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
+            <PaginatedTable
+              title="Historial de consumo"
+              headers={["Fecha", "Semana", "Animal", "Lote", "Kilos", "Bultos"]}
+              rows={[...records].reverse()}
+              renderRow={(r, i) => (
+                <tr key={i} style={{ background: i % 2 === 0 ? C.white : C.cream }}>
+                  <td style={st.td}>{formatDate(r.fecha)}</td>
+                  <td style={st.td}>Sem. {r.semana}</td>
+                  <td style={st.td}>{r.animal}</td>
+                  <td style={st.td}>{r.lote}</td>
+                  <td style={st.td}>{num(r.kilos, 1)} kg</td>
+                  <td style={st.td}>{num(r.bultos)}</td>
+                </tr>
+              )}
+            />
           )}
         </>
       )}
@@ -491,9 +628,14 @@ const st = {
   lotName: { margin: 0, fontSize: 17, color: C.text, fontWeight: 700 },
   lotAnimal: { margin: 0, fontSize: 11, color: C.muted, textTransform: "uppercase", letterSpacing: 1 },
   weekBadge: { background: C.green, color: C.white, fontSize: 11, padding: "4px 10px", borderRadius: 20 },
+  lotActions: { display: "flex", gap: 8, padding: "10px 18px", borderBottom: `1px solid ${C.border}`, flexWrap: "wrap" },
   editBtn: { background: C.white, border: `1.5px solid ${C.green}`, color: C.green, borderRadius: 8, padding: "6px 12px", fontSize: 12, cursor: "pointer", fontWeight: 700 },
   saveBtn: { background: C.green, border: "none", color: C.white, borderRadius: 8, padding: "6px 12px", fontSize: 12, cursor: "pointer", fontWeight: 700 },
+  salidaBtn: { background: C.white, border: `1.5px solid ${C.warn}`, color: C.warn, borderRadius: 8, padding: "6px 12px", fontSize: 12, cursor: "pointer", fontWeight: 700 },
   editPanel: { padding: "16px 18px", background: "#FFFBF5", borderBottom: `1px solid ${C.border}` },
+  salidaPanel: { padding: "16px 18px", background: "#FFF3EE", borderBottom: `1px solid ${C.border}` },
+  salidaSuccess: { margin: 0, color: C.green, fontWeight: 700, fontSize: 14, textAlign: "center", padding: "8px 0" },
+  salidaError: { margin: "8px 0 0", color: C.warn, fontSize: 12 },
   editTitle: { margin: "0 0 8px", fontSize: 11, letterSpacing: 1, textTransform: "uppercase", color: C.muted, fontWeight: 700 },
   editNote: { margin: "0 0 12px", fontSize: 11, color: C.muted, fontStyle: "italic" },
   editGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 },
@@ -511,6 +653,11 @@ const st = {
   table: { width: "100%", borderCollapse: "collapse", fontSize: 12 },
   th: { padding: "8px 12px", background: C.greenPale, color: C.green, fontWeight: 700, textAlign: "left", fontSize: 10, letterSpacing: 1, textTransform: "uppercase", whiteSpace: "nowrap" },
   td: { padding: "8px 12px", borderBottom: `1px solid ${C.border}`, color: C.text, whiteSpace: "nowrap" },
+  showMoreBtn: {
+    display: "block", width: "100%", padding: "12px", background: C.greenPale,
+    border: "none", color: C.green, fontWeight: 700, fontSize: 13, cursor: "pointer",
+    fontFamily: "sans-serif",
+  },
   footer: { textAlign: "center", fontSize: 11, color: C.muted, fontFamily: "sans-serif", letterSpacing: 1, marginTop: 24 },
 };
 
